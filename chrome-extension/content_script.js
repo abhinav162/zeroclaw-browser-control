@@ -1,0 +1,247 @@
+// ZeroClaw Content Script — DOM extractor + action executor
+// Injected into every page to handle scrape/click/fill/scroll/hover/get_text commands.
+
+(() => {
+  "use strict";
+
+  function resolveElement(selector) {
+    if (!selector) return null;
+
+    // Try CSS selector first
+    try {
+      const el = document.querySelector(selector);
+      if (el) return el;
+    } catch (_) {
+      // Not a valid CSS selector, fall through
+    }
+
+    // Try XPath
+    try {
+      const result = document.evaluate(
+        selector,
+        document,
+        null,
+        XPathResult.FIRST_ORDERED_NODE_TYPE,
+        null
+      );
+      if (result.singleNodeValue) return result.singleNodeValue;
+    } catch (_) {
+      // Not valid XPath either
+    }
+
+    // Try text content match — find element containing exact text
+    const walk = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+    let node;
+    while ((node = walk.nextNode())) {
+      if (node.textContent.trim() === selector.trim()) return node;
+    }
+
+    return null;
+  }
+
+  function scrape(params) {
+    const { selector, attribute, multiple } = params;
+
+    if (selector) {
+      const elements = multiple
+        ? Array.from(document.querySelectorAll(selector))
+        : [document.querySelector(selector)].filter(Boolean);
+
+      return elements.map((el) => {
+        if (attribute) return el.getAttribute(attribute);
+        return {
+          tag: el.tagName.toLowerCase(),
+          text: el.textContent.trim().slice(0, 2000),
+          html: el.outerHTML.slice(0, 5000),
+          attributes: Object.fromEntries(
+            Array.from(el.attributes).map((a) => [a.name, a.value])
+          ),
+        };
+      });
+    }
+
+    // Full page scrape — return structured data
+    const title = document.title;
+    const url = location.href;
+    const meta = {};
+    document.querySelectorAll("meta[name], meta[property]").forEach((m) => {
+      const key = m.getAttribute("name") || m.getAttribute("property");
+      meta[key] = m.getAttribute("content");
+    });
+
+    const links = Array.from(document.querySelectorAll("a[href]"))
+      .slice(0, 200)
+      .map((a) => ({ text: a.textContent.trim().slice(0, 200), href: a.href }));
+
+    const headings = Array.from(document.querySelectorAll("h1, h2, h3, h4, h5, h6"))
+      .slice(0, 100)
+      .map((h) => ({
+        level: parseInt(h.tagName[1]),
+        text: h.textContent.trim().slice(0, 500),
+      }));
+
+    const bodyText = document.body.innerText.slice(0, 50000);
+
+    return { title, url, meta, links, headings, bodyText };
+  }
+
+  function click(params) {
+    const el = resolveElement(params.selector);
+    if (!el) throw new Error(`Element not found: ${params.selector}`);
+
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+
+    // Dispatch full click sequence
+    el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+    el.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+
+    return { clicked: params.selector, tag: el.tagName.toLowerCase() };
+  }
+
+  function fill(params) {
+    const el = resolveElement(params.selector);
+    if (!el) throw new Error(`Element not found: ${params.selector}`);
+
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    el.focus();
+
+    // Clear existing value
+    const nativeInputValueSetter =
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set ||
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+
+    if (nativeInputValueSetter) {
+      nativeInputValueSetter.call(el, params.value);
+    } else {
+      el.value = params.value;
+    }
+
+    // Trigger framework-compatible events
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+
+    if (params.submit) {
+      const form = el.closest("form");
+      if (form) form.submit();
+    }
+
+    return { filled: params.selector, value: params.value };
+  }
+
+  function scroll(params) {
+    const { direction = "down", amount = 500, selector } = params;
+
+    const target = selector ? resolveElement(selector) : window;
+    if (selector && !target) throw new Error(`Element not found: ${selector}`);
+
+    const scrollOpts = { behavior: "smooth" };
+    switch (direction) {
+      case "down":
+        scrollOpts.top = amount;
+        break;
+      case "up":
+        scrollOpts.top = -amount;
+        break;
+      case "left":
+        scrollOpts.left = -amount;
+        break;
+      case "right":
+        scrollOpts.left = amount;
+        break;
+      case "top":
+        if (target === window) {
+          window.scrollTo({ top: 0, behavior: "smooth" });
+          return { scrolled: "top" };
+        }
+        target.scrollTop = 0;
+        return { scrolled: "top" };
+      case "bottom":
+        if (target === window) {
+          window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+          return { scrolled: "bottom" };
+        }
+        target.scrollTop = target.scrollHeight;
+        return { scrolled: "bottom" };
+      default:
+        throw new Error(`Unknown scroll direction: ${direction}`);
+    }
+
+    if (target === window) {
+      window.scrollBy(scrollOpts);
+    } else {
+      target.scrollBy(scrollOpts);
+    }
+
+    return {
+      scrolled: direction,
+      amount,
+      scrollY: window.scrollY,
+      scrollHeight: document.body.scrollHeight,
+    };
+  }
+
+  function hover(params) {
+    const el = resolveElement(params.selector);
+    if (!el) throw new Error(`Element not found: ${params.selector}`);
+
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    el.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true }));
+
+    return { hovered: params.selector, tag: el.tagName.toLowerCase() };
+  }
+
+  function getText(params) {
+    const el = resolveElement(params.selector);
+    if (!el) throw new Error(`Element not found: ${params.selector}`);
+    return { text: el.textContent.trim().slice(0, 10000) };
+  }
+
+  function getTitle() {
+    return { title: document.title, url: location.href };
+  }
+
+  // Message handler — receives commands from background.js
+  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message.source !== "zeroclaw") return false;
+
+    const { action, params = {} } = message;
+
+    try {
+      let result;
+      switch (action) {
+        case "scrape":
+          result = scrape(params);
+          break;
+        case "click":
+          result = click(params);
+          break;
+        case "fill":
+          result = fill(params);
+          break;
+        case "scroll":
+          result = scroll(params);
+          break;
+        case "hover":
+          result = hover(params);
+          break;
+        case "get_text":
+          result = getText(params);
+          break;
+        case "get_title":
+          result = getTitle();
+          break;
+        default:
+          sendResponse({ success: false, error: `Unknown content action: ${action}` });
+          return true;
+      }
+      sendResponse({ success: true, data: result });
+    } catch (err) {
+      sendResponse({ success: false, error: err.message });
+    }
+
+    return true; // keep sendResponse channel open
+  });
+})();
