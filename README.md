@@ -1,104 +1,59 @@
-# ZeroClaw Browser Control
+# ZeroClaw Browser Control — Chrome Extension
 
-Chrome extension + local bridge server that lets ZeroClaw (AI assistant) control and scrape Chrome tabs via commands.
+Chrome extension that allows [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) AI agent to control and scrape Chrome tabs via commands.
 
-## Architecture
+## How It Works
 
 ```
-ZeroClaw AI / CLI
-       │
+ZeroClaw Agent
        │  HTTP POST (port 7823)
        ▼
-┌─────────────────┐
-│  Bridge Server   │  Node.js (Express + WS)
-│  REST → WebSocket│
-└────────┬────────┘
-         │  WebSocket (port 7822)
-         ▼
-┌─────────────────┐
-│ Chrome Extension │  MV3 Service Worker
-│  background.js   │  ↔ content_script.js
-└─────────────────┘
-         │
-         ▼
-    Browser DOM
+Bridge Server (auto-spawned by ZeroClaw)
+       │  WebSocket (port 7822)
+       ▼
+This Chrome Extension
+       │  Chrome APIs + DOM
+       ▼
+  Your Browser
 ```
 
-## Quick Start
+ZeroClaw auto-starts the bridge server internally. This repo contains **only the Chrome extension** — you just need to load it once.
 
-### 1. Install dependencies
-
-```bash
-cd bridge-server
-npm install
-```
-
-### 2. Start the bridge server
-
-```bash
-cd bridge-server
-npm start
-```
-
-### 3. Load the Chrome extension
+## Setup
 
 1. Open Chrome → `chrome://extensions/`
 2. Enable **Developer mode** (top right toggle)
 3. Click **Load unpacked**
-4. Select the `chrome-extension/` directory
+4. Select the `chrome-extension/` directory from this repo
 
-The extension auto-connects to `ws://localhost:7822` when the bridge server is running.
+That's it. The extension auto-connects to the bridge server when ZeroClaw starts.
 
-### 4. Send commands
+## ZeroClaw Configuration
 
-Using the CLI wrapper:
+In `~/.zeroclaw/config.toml`:
 
-```bash
-chmod +x zc-browser.sh
+```toml
+[browser]
+enabled = true
+backend = "bridge"
+allowed_domains = ["*"]
 
-# Navigate
-./zc-browser.sh navigate url=https://example.com
-
-# Click
-./zc-browser.sh click selector="#my-button"
-
-# Fill input
-./zc-browser.sh fill selector="#email" value="user@example.com"
-
-# Scrape page
-./zc-browser.sh scrape
-
-# Screenshot
-./zc-browser.sh screenshot
-
-# Check status
-./zc-browser.sh health
+[browser.bridge]
+endpoint = "http://127.0.0.1:7823/command"
+timeout_ms = 30000
+auto_start = true
 ```
 
-Or via curl:
-
-```bash
-# Unified endpoint
-curl -X POST http://localhost:7823/command \
-  -H "Content-Type: application/json" \
-  -d '{"action": "navigate", "url": "https://example.com"}'
-
-# Shortcut endpoints
-curl -X POST http://localhost:7823/navigate \
-  -H "Content-Type: application/json" \
-  -d '{"url": "https://example.com"}'
-```
-
-## Commands
+## Supported Commands
 
 | Action | Parameters | Description |
 |--------|-----------|-------------|
 | `navigate` | `url` (required), `tabId` | Navigate to a URL |
 | `click` | `selector` (required), `tabId` | Click an element (CSS/XPath/text) |
-| `fill` | `selector` (required), `value` (required), `submit`, `tabId` | Fill an input field |
+| `fill` | `selector`, `value` (required), `submit`, `tabId` | Fill an input field |
 | `scrape` | `selector`, `attribute`, `multiple`, `tabId` | Scrape page or specific elements |
 | `screenshot` | `tabId` | Capture visible tab as base64 PNG |
-| `scroll` | `direction` (up/down/left/right/top/bottom), `amount`, `selector`, `tabId` | Scroll the page |
+| `scroll` | `direction`, `amount`, `selector`, `tabId` | Scroll the page |
 | `hover` | `selector` (required), `tabId` | Hover over an element |
 | `get_text` | `selector` (required), `tabId` | Get text content of an element |
 | `get_title` | `tabId` | Get page title and URL |
@@ -110,73 +65,37 @@ Selectors are resolved in order:
 2. **XPath** — `//div[@class="foo"]`
 3. **Text match** — exact text content of an element
 
-### Response Format
+## CLI Wrapper
 
-All responses follow this structure:
+`zc-browser.sh` lets you send commands directly to the bridge server for testing:
 
-```json
-{
-  "success": true,
-  "data": { ... }
-}
+```bash
+./zc-browser.sh navigate url=https://example.com
+./zc-browser.sh scrape selector="h1"
+./zc-browser.sh get_title
+./zc-browser.sh health
 ```
-
-On error:
-
-```json
-{
-  "success": false,
-  "error": "Description of what went wrong"
-}
-```
-
-## API Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/health` | Server status + extension connection |
-| `POST` | `/command` | Send any command (`action` field required) |
-| `POST` | `/<action>` | Shortcut for each action (params in body) |
-
-## Configuration
-
-| Env Variable | Default | Description |
-|-------------|---------|-------------|
-| `ZC_BRIDGE_HOST` | `localhost` | Bridge server host (for CLI) |
-| `ZC_BRIDGE_PORT` | `7823` | Bridge server REST port (for CLI) |
-
-Ports are configured in `bridge-server/server.js`:
-- **7822** — WebSocket (extension ↔ server)
-- **7823** — REST API (CLI/AI → server)
 
 ## Troubleshooting
 
 **Extension not connecting:**
-- Ensure bridge server is running (`./zc-browser.sh health`)
-- Check Chrome extension page for errors
+- Ensure ZeroClaw is running with `backend = "bridge"`
+- Check `curl http://localhost:7823/health` — should show `extensionConnected: true`
 - Reload the extension from `chrome://extensions/`
 
 **Commands timing out:**
-- Ensure you have an active tab open
-- Check that the page has finished loading
-- Some pages block content script injection (chrome://, extension pages)
-
-**Content script errors:**
-- Verify the selector is correct
-- Try using a CSS selector first, then XPath
-- For dynamic content, add a delay after navigation
+- Ensure you have an active tab open in Chrome
+- Some pages block content script injection (`chrome://` pages, extension pages)
 
 ## Project Structure
 
 ```
-zeroclaw-extension/
+zeroclaw-browser-control/
 ├── chrome-extension/
 │   ├── manifest.json          # MV3 manifest
 │   ├── background.js          # WebSocket client + command router
-│   └── content_script.js      # DOM extractor + action executor
-├── bridge-server/
-│   ├── server.js              # Express + WebSocket server
-│   └── package.json
-├── zc-browser.sh              # CLI wrapper script
+│   ├── content_script.js      # DOM extractor + action executor
+│   └── icons/
+├── zc-browser.sh              # CLI wrapper (optional)
 └── README.md
 ```
