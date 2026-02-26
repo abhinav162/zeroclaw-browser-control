@@ -1,16 +1,18 @@
 // ZeroClaw Background Service Worker — WebSocket client + command router
 // Connects to bridge-server at ws://localhost:7822 and routes commands to content scripts or Chrome APIs.
+//
+// MV3 service workers get suspended after ~30s of inactivity.
+// We use chrome.alarms (which persist across suspensions) to ensure reconnection
+// whenever the bridge server restarts.
 
 (() => {
   "use strict";
 
   const WS_URL = "ws://localhost:7822";
-  const RECONNECT_BASE_MS = 1000;
-  const RECONNECT_MAX_MS = 30000;
+  const RECONNECT_ALARM = "zeroclaw-reconnect";
+  const KEEPALIVE_ALARM = "zeroclaw-keepalive";
 
   let ws = null;
-  let reconnectDelay = RECONNECT_BASE_MS;
-  let reconnectTimer = null;
 
   // --- WebSocket connection management ---
 
@@ -23,13 +25,16 @@
       ws = new WebSocket(WS_URL);
     } catch (err) {
       console.error("[ZeroClaw] WebSocket creation failed:", err.message);
-      scheduleReconnect();
+      ensureReconnectAlarm();
       return;
     }
 
     ws.onopen = () => {
       console.log("[ZeroClaw] Connected to bridge server");
-      reconnectDelay = RECONNECT_BASE_MS;
+      // Stop reconnect polling — we're connected
+      chrome.alarms.clear(RECONNECT_ALARM);
+      // Start keep-alive to prevent service worker suspension while connected
+      chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.4 }); // ~24s
       send({ type: "extension_ready", version: chrome.runtime.getManifest().version });
     };
 
@@ -58,7 +63,9 @@
     ws.onclose = () => {
       console.log("[ZeroClaw] Disconnected from bridge server");
       ws = null;
-      scheduleReconnect();
+      // Stop keep-alive, start reconnect polling
+      chrome.alarms.clear(KEEPALIVE_ALARM);
+      ensureReconnectAlarm();
     };
   }
 
@@ -68,13 +75,35 @@
     }
   }
 
-  function scheduleReconnect() {
-    if (reconnectTimer) clearTimeout(reconnectTimer);
-    reconnectTimer = setTimeout(() => {
-      reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
-      connect();
-    }, reconnectDelay);
+  // Alarm-based reconnection: survives service worker suspension
+  function ensureReconnectAlarm() {
+    chrome.alarms.get(RECONNECT_ALARM, (alarm) => {
+      if (!alarm) {
+        // Poll every 5s to reconnect
+        chrome.alarms.create(RECONNECT_ALARM, {
+          delayInMinutes: 0.08,       // first attempt in ~5s
+          periodInMinutes: 0.08,      // then every ~5s
+        });
+      }
+    });
   }
+
+  // --- Alarm listener (wakes the service worker) ---
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name === RECONNECT_ALARM) {
+      connect();
+    }
+    if (alarm.name === KEEPALIVE_ALARM) {
+      // Send ping to keep connection alive + prevent worker suspension
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        send({ type: "ping" });
+      } else {
+        // Connection lost — switch to reconnect mode
+        chrome.alarms.clear(KEEPALIVE_ALARM);
+        ensureReconnectAlarm();
+      }
+    }
+  });
 
   // --- Command routing ---
 
@@ -112,7 +141,6 @@
       return { tabId: tab.id, url: tab.url, title: tab.title };
     }
 
-    // Use the active tab in the current window
     const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (activeTab) {
       const tab = await chrome.tabs.update(activeTab.id, { url: targetUrl });
@@ -121,7 +149,6 @@
       return { tabId: updated.id, url: updated.url, title: updated.title };
     }
 
-    // No active tab — create one
     const tab = await chrome.tabs.create({ url: targetUrl });
     await waitForTabLoad(tab.id);
     const updated = await chrome.tabs.get(tab.id);
@@ -139,7 +166,6 @@
         if (details.tabId === tabId && details.frameId === 0) {
           clearTimeout(timer);
           chrome.webNavigation.onCompleted.removeListener(listener);
-          // Small delay for page scripts to settle
           setTimeout(resolve, 500);
         }
       }
@@ -158,9 +184,7 @@
       targetTabId = activeTab.id;
     }
 
-    // Focus the tab before capturing
     await chrome.tabs.update(targetTabId, { active: true });
-    // Small delay for render
     await new Promise((r) => setTimeout(r, 300));
 
     const dataUrl = await chrome.tabs.captureVisibleTab(null, {
@@ -195,7 +219,6 @@
       targetTabId = activeTab.id;
     }
 
-    // Ensure content script is injected
     try {
       await chrome.scripting.executeScript({
         target: { tabId: targetTabId },
@@ -239,14 +262,7 @@
   // --- Startup ---
   connect();
 
-  // Re-connect on service worker wake-up
+  // Re-connect on service worker wake-up events
   chrome.runtime.onStartup.addListener(connect);
   chrome.runtime.onInstalled.addListener(connect);
-
-  // Keep-alive: ping every 25s to prevent service worker termination
-  setInterval(() => {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      send({ type: "ping" });
-    }
-  }, 25000);
 })();
