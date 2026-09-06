@@ -90,20 +90,32 @@
       // Not valid XPath either
     }
 
+    // A selector starting with #, ., or [ is an id/class/attribute selector, not
+    // human-visible text. The text-equality fallbacks are meant for a literal
+    // label like "Submit"; matching "#save-btn" against a <code> that prints that
+    // string is always wrong — and it stops resolveElement ever returning null,
+    // which is exactly what a drifted selector needs so fingerprint healing can
+    // take over. So a CSS-shaped selector skips both text tiers.
+    const textFallbackOk = !/^[#.\[]/.test(selector.trim());
+
     // Try text content match — find element containing exact text
-    const walk = document.createTreeWalker(
-      document.body,
-      NodeFilter.SHOW_ELEMENT,
-    );
-    let node;
-    while ((node = walk.nextNode())) {
-      if (node.textContent.trim() === selector.trim()) return node;
+    if (textFallbackOk) {
+      const walk = document.createTreeWalker(
+        document.body,
+        NodeFilter.SHOW_ELEMENT,
+      );
+      let node;
+      while ((node = walk.nextNode())) {
+        if (node.textContent.trim() === selector.trim()) return node;
+      }
     }
 
     // Same lookups again, this time piercing shadow roots. Deliberately last:
-    // a page that resolves in the light DOM takes the exact path it always
-    // did, and only a miss pays for the walk.
-    return deepQuery(selector) || deepTextMatch(selector);
+    // a page that resolves in the light DOM takes the exact path it always did,
+    // and only a miss pays for the walk. deepTextMatch is a text-equality
+    // fallback too, so it is gated the same way; deepQuery (a real CSS query)
+    // always runs.
+    return deepQuery(selector) || (textFallbackOk ? deepTextMatch(selector) : null);
   }
 
   // chrome.dom.openOrClosedShadowRoot is an extension-only API that reaches
@@ -160,6 +172,101 @@
     return null;
   }
 
+  // ── Self-healing selectors (fingerprint relocation) ─────────────────
+  // A selector tied to an id or class breaks when the site is restyled. If the
+  // caller kept the fingerprint a previous resolve handed back, we can find the
+  // element again by structural similarity — Scrapling's trick, no AI. Captured
+  // cheaply, scored only when the selector misses.
+  const FP_THRESHOLD = 0.6;
+  const FP_ATTRS = ["name", "type", "role", "aria-label", "placeholder", "href", "title", "alt"];
+  let lastHealed = false;
+
+  function fingerprint(el) {
+    const attrs = {};
+    const id = el.id || (el.getAttribute && el.getAttribute("id"));
+    if (id) attrs.id = id;
+    const cls = el.className || (el.getAttribute && el.getAttribute("class"));
+    if (cls) attrs.class = String(cls);
+    for (const name of FP_ATTRS) {
+      const v = el.getAttribute && el.getAttribute(name);
+      if (v) attrs[name] = v;
+    }
+    const parent = el.parentElement;
+    return {
+      tag: el.tagName.toLowerCase(),
+      text: (el.textContent || "").trim().replace(/\s+/g, " ").slice(0, 50),
+      attrs,
+      siblingTags: parent
+        ? [...parent.children].map((c) => c.tagName.toLowerCase())
+        : [],
+      parent: parent
+        ? {
+            tag: parent.tagName.toLowerCase(),
+            id: parent.id || undefined,
+            class: (parent.className && String(parent.className)) || undefined,
+          }
+        : {},
+    };
+  }
+
+  // Dice coefficient over whitespace tokens — order-independent, cheap, and
+  // gives partial credit (a renamed class that keeps most of its words still
+  // scores). Two empty strings are identical; one empty is a miss.
+  function tokenSim(s1, s2) {
+    const t1 = new Set((s1 || "").toLowerCase().split(/\s+/).filter(Boolean));
+    const t2 = new Set((s2 || "").toLowerCase().split(/\s+/).filter(Boolean));
+    if (!t1.size && !t2.size) return 1;
+    if (!t1.size || !t2.size) return 0;
+    let inter = 0;
+    for (const t of t1) if (t2.has(t)) inter++;
+    return (2 * inter) / (t1.size + t2.size);
+  }
+
+  function attrsSim(a = {}, b = {}) {
+    const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+    if (!keys.size) return 1;
+    let score = 0;
+    for (const k of keys) {
+      const va = a[k] || "";
+      const vb = b[k] || "";
+      if (!va || !vb) continue; // present on one side only → 0 for this key
+      score += k === "class" ? tokenSim(va, vb) : va === vb ? 1 : 0;
+    }
+    return score / keys.size;
+  }
+
+  function similarity(a, b) {
+    const tag = a.tag === b.tag ? 1 : 0;
+    const text = tokenSim(a.text, b.text);
+    const attrs = attrsSim(a.attrs, b.attrs);
+    const sib = tokenSim(
+      (a.siblingTags || []).join(" "),
+      (b.siblingTags || []).join(" "),
+    );
+    const par =
+      a.parent && b.parent && a.parent.tag && a.parent.tag === b.parent.tag
+        ? 1
+        : 0;
+    const structure = (sib + par) / 2;
+    return 0.2 * tag + 0.25 * text + 0.35 * attrs + 0.2 * structure;
+  }
+
+  // Scan every element (piercing shadow roots) and return the best structural
+  // match above the threshold. O(nodes) — only ever called on a selector miss.
+  function relocate(fp) {
+    if (!fp || !fp.tag) return null;
+    let best = null;
+    let bestScore = 0;
+    for (const el of deepQuery("*", true)) {
+      const score = similarity(fp, fingerprint(el));
+      if (score > bestScore) {
+        bestScore = score;
+        best = el;
+      }
+    }
+    return bestScore >= FP_THRESHOLD ? best : null;
+  }
+
   // Modals and portals mount a moment after the click that triggers them, so a
   // miss is usually "too early" rather than "not there". Back off between
   // attempts so a genuinely absent element in a large app does not pay for the
@@ -169,9 +276,25 @@
   // _noWait: true so each frame answers instantly. The retry is reserved for a
   // targeted second pass on the frame most likely to contain a late element
   // (frame 0, where portals mount into document.body).
-  async function waitForElement(selector, noWait = false) {
+  async function waitForElement(selector, noWait = false, fp = null) {
+    lastHealed = false;
     const el = resolveElement(selector);
     if (el) return el;
+
+    // Selector missed. If the caller supplied a fingerprint, they're telling us
+    // the selector may have drifted — try relocating right away rather than
+    // waiting out the full timeout for an element that has been renamed.
+    // ponytail: selector is still tried first every round, so it wins whenever
+    // it matches; relocation only fills a genuine miss. A decoy that outscores a
+    // late-rendering real element at t=0 is the rare wrong match — acceptable
+    // since the caller opted in by passing a fingerprint.
+    if (fp) {
+      const healed = relocate(fp);
+      if (healed) {
+        lastHealed = true;
+        return healed;
+      }
+    }
     if (noWait) throw new Error(`Element not found: ${selector}`);
 
     const deadline = Date.now() + ELEMENT_WAIT_MS;
@@ -180,11 +303,95 @@
       await new Promise((r) => setTimeout(r, delay));
       const found = resolveElement(selector);
       if (found) return found;
+      if (fp) {
+        const healed = relocate(fp);
+        if (healed) {
+          lastHealed = true;
+          return healed;
+        }
+      }
       if (Date.now() >= deadline) {
         throw new Error(`Element not found: ${selector}`);
       }
       delay = Math.min(delay * 2, 800);
     }
+  }
+
+  // ── Actionability gate ──────────────────────────────────────────────
+  // Resolving a selector is not enough — Playwright's insight. An element can be
+  // present but hidden, disabled, or sitting under an overlay (a cookie banner,
+  // a modal backdrop) that swallows the click. el.dispatchEvent fires on the
+  // node regardless and "succeeds" on the wrong target, silently. So before we
+  // act we gate on the same checks Playwright does — visible, enabled, and (for
+  // clicks) the real hit-test target — polling until they hold, because they
+  // settle a beat after a dialog animates in.
+
+  function isElementVisible(el) {
+    const style = window.getComputedStyle(el);
+    if (
+      style.display === "none" ||
+      style.visibility === "hidden" ||
+      Number(style.opacity || 1) === 0
+    )
+      return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  function isElementEnabled(el) {
+    return !el.disabled && el.getAttribute("aria-disabled") !== "true";
+  }
+
+  // Does a click at the element's centre actually reach it? elementFromPoint
+  // returns the topmost node painted at those coordinates; if that is neither
+  // our element nor kin to it, something is on top and would eat the click.
+  // ponytail: centre-point only, in the element's own document. A point inside a
+  // nested shadow tree resolves to the shadow host, which contains() in either
+  // direction still accepts; a target covered only at its centre is the rare
+  // miss. Upgrade to a multi-point probe if a real page needs it.
+  function receivesPointerEvents(el) {
+    const rect = el.getBoundingClientRect();
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    const doc = el.ownerDocument || document;
+    const hit = doc.elementFromPoint(cx, cy);
+    if (!hit) return false;
+    return hit === el || el.contains(hit) || hit.contains(el);
+  }
+
+  // Poll a predicate until it holds or the deadline passes. Same backoff shape
+  // as waitForElement, so a condition that settles on the next frame is caught
+  // quickly and a stuck one gives up instead of hanging. timeout=0 checks once
+  // (the fast cross-frame probe path). Shared with any future post-action state
+  // check — the reusable half of the gate.
+  async function pollUntil(predicate, timeout = ELEMENT_WAIT_MS) {
+    const deadline = Date.now() + timeout;
+    let delay = 50;
+    for (;;) {
+      if (predicate()) return true;
+      if (Date.now() >= deadline) return false;
+      await new Promise((r) => setTimeout(r, delay));
+      delay = Math.min(delay * 2, 400);
+    }
+  }
+
+  // Gate an action on the element being ready, reporting which check failed so
+  // the agent hears "covered by another element" or "disabled" rather than a
+  // bare failure it cannot reason about.
+  async function waitForActionable(
+    el,
+    selector,
+    { hitTest = true, timeout = ELEMENT_WAIT_MS } = {},
+  ) {
+    let reason = "not visible";
+    const ok = await pollUntil(() => {
+      if (!isElementVisible(el)) return (reason = "not visible"), false;
+      if (!isElementEnabled(el)) return (reason = "disabled"), false;
+      if (hitTest && !receivesPointerEvents(el))
+        return (reason = "covered by another element"), false;
+      return true;
+    }, timeout);
+    if (!ok) throw new Error(`Element not actionable (${reason}): ${selector}`);
   }
 
   function snapshot(params) {
@@ -517,9 +724,13 @@
   }
 
   async function click(params) {
-    const el = await waitForElement(params.selector, params._noWait);
+    const el = await waitForElement(params.selector, params._noWait, params.fingerprint);
+    const healed = lastHealed;
 
     el.scrollIntoView({ behavior: "smooth", block: "center" });
+    await waitForActionable(el, params.selector, {
+      timeout: params._noWait ? 0 : ELEMENT_WAIT_MS,
+    });
 
     // Dispatch full click sequence
     el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
@@ -527,13 +738,28 @@
     el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
     el.dispatchEvent(new MouseEvent("click", { bubbles: true }));
 
-    return { clicked: params.selector, tag: el.tagName.toLowerCase() };
+    // Return the fingerprint so the caller can store it and heal a future drift;
+    // healed:true means the selector missed and relocation found the element.
+    return {
+      clicked: params.selector,
+      tag: el.tagName.toLowerCase(),
+      fingerprint: fingerprint(el),
+      healed,
+    };
   }
 
   async function fill(params) {
-    const el = await waitForElement(params.selector, params._noWait);
+    const el = await waitForElement(params.selector, params._noWait, params.fingerprint);
+    const healed = lastHealed;
 
     el.scrollIntoView({ behavior: "smooth", block: "center" });
+    // fill sets the value programmatically, so a covering overlay does not block
+    // it the way it blocks a click — visible + enabled is the meaningful gate,
+    // no hit-test.
+    await waitForActionable(el, params.selector, {
+      hitTest: false,
+      timeout: params._noWait ? 0 : ELEMENT_WAIT_MS,
+    });
     el.focus();
 
     // The DOM's value setters are branded to their own interface: reading the
@@ -569,7 +795,12 @@
       if (form) form.submit();
     }
 
-    return { filled: params.selector, value: params.value };
+    return {
+      filled: params.selector,
+      value: params.value,
+      fingerprint: fingerprint(el),
+      healed,
+    };
   }
 
   async function scroll(params) {
